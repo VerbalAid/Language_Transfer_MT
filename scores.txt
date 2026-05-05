@@ -1,0 +1,3 @@
+Baseline SacreBLEU: 3.24
+Fine-tuned SacreBLEU: 16.52
+Delta: +13.28
