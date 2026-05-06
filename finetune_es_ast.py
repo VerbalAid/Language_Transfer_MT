@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-Fine-tune **MarianMT** `Helsinki-NLP/opus-mt-es-ca` (Spanish→Catalan checkpoint) on
-**Spanish→Asturian** parallel data (`projecte-aina/ES-AST_Parallel_Corpus`).
+Multilingual fine-tuning: Spanish → Asturian / Galician / Portuguese
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Base model : facebook/nllb-200-distilled-600M  (600M params, ≤1B ✓)
+Method     : LoRA (PEFT) — ~0.5% trainable params, fits 8GB VRAM
+Data       : ES-AST full 704k  +  ES-GL (OPUS-100)  +  ES-PT (OPUS-100)
+Eval       : FLORES+ devtest  spa_Latn → ast_Latn  (SacreBLEU)
+Hardware   : NVIDIA RTX 4060 (bf16, gradient checkpointing)
 
+Install:
+    pip install transformers datasets evaluate sacrebleu sentencepiece \
+                peft accelerate torch
 
-Default profile: subsampled train/val, 1 epoch, memory-efficient optim (Adafactor) +
-gradient checkpointing so micro-batch size can stay high on ~8GB GPUs.
-Use --full for the full split and 3 epochs (still slow).
+Usage:
+    python finetune_es_ast.py                  # default run
+    python finetune_es_ast.py --skip_data      # reuse cached tok data
+    python finetune_es_ast.py --gl_samples 0   # AST+PT only
 """
 from __future__ import annotations
 
@@ -17,399 +26,404 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
+from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
+    GenerationConfig,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
 )
 
 import evaluate
 
-FAST_TRAIN_SAMPLES = 100_000
-FAST_EVAL_SAMPLES = 4_000
-# Defaults; VRAM auto-tune (after model is on GPU) may lower micro-batch and raise grad_accum.
-FAST_TRAIN_BS = 8
-FAST_GRAD_ACCUM = 2
-FAST_EVAL_BS = 4
-FAST_EPOCHS = 1.0
-TARGET_EFFECTIVE_BATCH_FAST = 16
-TARGET_EFFECTIVE_BATCH_FULL = 8
+# ── NLLB language codes ───────────────────────────────────────────
+SRC_LANG = "spa_Latn"   # Spanish (source for all pairs)
+AST_LANG = "ast_Latn"   # Asturian  ← primary target
+GL_LANG  = "glg_Latn"   # Galician  ← cross-lingual transfer
+PT_LANG  = "por_Latn"   # Portuguese ← broader Romance grounding
+
+# ── model ─────────────────────────────────────────────────────────
+MODEL_CHECKPOINT = "facebook/nllb-200-distilled-600M"
+MAX_LENGTH       = 128
+
+# ── data caps ─────────────────────────────────────────────────────
+# AST: use full corpus (704k) — no cap by default
+# GL / PT: capped to keep training time reasonable on RTX 4060
+DEFAULT_GL_SAMPLES = 200_000
+DEFAULT_PT_SAMPLES = 200_000
+DEFAULT_EVAL_SAMPLES = 4_000
+
+# ── training defaults ─────────────────────────────────────────────
+# LoRA cuts VRAM dramatically: we can use a larger effective batch
+# without gradient accumulation, making steps faster.
+# Micro-batch tuned for ~8GB VRAM (NLLB-600M + LoRA + checkpointing + generate-eval spikes VRAM).
+TRAIN_BS    = 4    # micro-batch per GPU
+GRAD_ACCUM  = 4    # effective batch = TRAIN_BS × GRAD_ACCUM = 16
+EVAL_BS     = 4
+EPOCHS      = 1
+LR          = 5e-4       # LoRA converges well with higher LR
+WARMUP_RATIO = 0.05
+LORA_R      = 16         # LoRA rank — 16 is a good balance
+LORA_ALPHA  = 32         # = 2 × r (standard)
+LORA_DROPOUT = 0.05
+
+# Attention projection names in NLLB / M2M architecture
+LORA_TARGET_MODULES = ["q_proj", "v_proj", "k_proj", "out_proj"]
 
 
-def max_microbatch_for_free_gib(free_gib: float) -> int:
-    """Conservative Marian seq2seq + checkpointing; free_gib = cuda mem free after model load."""
-    if free_gib >= 5.5:
-        return 16
-    if free_gib >= 4.0:
-        return 8
-    if free_gib >= 2.8:
-        return 6
-    if free_gib >= 2.0:
-        return 4
-    if free_gib >= 1.2:
-        return 2
-    return 1
-
-
-def apply_vram_clamp(
-    *,
-    free_gib: float,
-    train_bs: int,
-    eval_bs: int,
-    grad_accum: int,
-    target_effective: int,
-) -> tuple[int, int, int, str]:
-    """Clamp micro-batches to fit free VRAM; raise grad_accum to stay near target_effective."""
-    max_micro = max_microbatch_for_free_gib(free_gib)
-    note_parts: list[str] = []
-    if train_bs > max_micro:
-        note_parts.append(
-            f"train micro-batch {train_bs}→{max_micro} (~{free_gib:.2f} GiB free after model on GPU)"
-        )
-        train_bs = max_micro
-
-    eval_bs = min(eval_bs, max(1, max_micro), 8)
-
-    min_accum = max(1, (target_effective + train_bs - 1) // train_bs)
-    new_accum = max(grad_accum, min_accum)
-    if new_accum > grad_accum:
-        note_parts.append(
-            f"grad_accum {grad_accum}→{new_accum} (effective batch ≈ {train_bs * new_accum}, target {target_effective})"
-        )
-    grad_accum = min(new_accum, 64)
-
-    note = (
-        "Auto VRAM: " + "; ".join(note_parts)
-        if note_parts
-        else f"Auto VRAM: train_bs={train_bs}, grad_accum={grad_accum} (fits ~{free_gib:.2f} GiB free)."
-    )
-    return train_bs, eval_bs, grad_accum, note
-
-
+# ─────────────────────────────────────────────────────────────────
+# Argument parsing
+# ─────────────────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument(
-        "--full",
-        action="store_true",
-        help="Train on the full split (~634k train, ~70k val), 3 epochs, step-based eval (slow).",
+    p = argparse.ArgumentParser(
+        description="Multilingual spa→{ast,gl,pt} fine-tuning with LoRA on NLLB-200-600M"
     )
-    p.add_argument(
-        "--max_train_samples",
-        type=int,
-        default=None,
-        help="Cap training rows after split (default: 100k fast / no cap with --full).",
-    )
-    p.add_argument(
-        "--max_eval_samples",
-        type=int,
-        default=None,
-        help="Cap validation rows for BLEU during training (default: 4k fast / no cap with --full).",
-    )
-    p.add_argument(
-        "--num_train_epochs",
-        type=float,
-        default=None,
-        help="Epochs (default: 1 fast / 3 with --full).",
-    )
-    p.add_argument("--per_device_train_batch_size", type=int, default=None)
-    p.add_argument("--per_device_eval_batch_size", type=int, default=None)
-    p.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=None,
-        help="Override gradient accumulation (default: 2 fast / 1 full unless auto-tune changes it).",
-    )
-    p.add_argument(
-        "--optim",
-        type=str,
-        default="adafactor",
-        choices=("adafactor", "adamw_torch"),
-        help="adafactor uses far less optimizer VRAM than AdamW (recommended on 8GB GPUs).",
-    )
-    p.add_argument("--output_dir", type=str, default="./mt_checkpoints")
-    p.add_argument("--save_dir", type=str, default="./finetuned_es_ast")
-    p.add_argument(
-        "--skip_tokenize",
-        action="store_true",
-        help="Load ./tokenized_es_ast and ./raw_es_ast from disk instead of HF + map.",
-    )
-    p.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        default=None,
-        help="Path to a checkpoint-* folder to resume training.",
-    )
-    p.add_argument(
-        "--no_auto_batch",
-        action="store_true",
-        help="Do not clamp batch sizes to free VRAM (you will OOM if settings are too large).",
-    )
+    p.add_argument("--output_dir",   default="./mt_checkpoints_multi",
+                   help="Trainer checkpoint directory.")
+    p.add_argument("--save_dir",     default="./finetuned_multi_ast",
+                   help="Final model save directory.")
+    p.add_argument("--cache_dir",    default="./cached_multi",
+                   help="Tokenized dataset cache directory.")
+    p.add_argument("--gl_samples",   type=int, default=DEFAULT_GL_SAMPLES,
+                   help="Max Galician training pairs (0 = skip).")
+    p.add_argument("--pt_samples",   type=int, default=DEFAULT_PT_SAMPLES,
+                   help="Max Portuguese training pairs (0 = skip).")
+    p.add_argument("--eval_samples", type=int, default=DEFAULT_EVAL_SAMPLES,
+                   help="Max validation pairs (AST only).")
+    p.add_argument("--epochs",       type=float, default=EPOCHS)
+    p.add_argument("--lora_r",       type=int, default=LORA_R,
+                   help="LoRA rank. Higher = more capacity, more VRAM.")
+    p.add_argument("--skip_data",    action="store_true",
+                   help="Load tokenized data from --cache_dir instead of re-processing.")
+    p.add_argument("--merge_weights", action="store_true",
+                   help="Merge LoRA weights into base model before saving.")
     return p.parse_args()
 
 
+# ─────────────────────────────────────────────────────────────────
+# Data loading
+# ─────────────────────────────────────────────────────────────────
+def load_ast() -> Dataset:
+    """Full projecte-aina ES-AST corpus (~704k pairs)."""
+    print("Loading ES-AST corpus (full)…")
+    ds = load_dataset("projecte-aina/ES-AST_Parallel_Corpus", split="train")
+    rows = [
+        {"source": r["es"], "target": r["ast"],
+         "src_lang": SRC_LANG, "tgt_lang": AST_LANG}
+        for r in ds
+    ]
+    print(f"  ES-AST: {len(rows):,} pairs")
+    return Dataset.from_list(rows)
+
+
+def load_opus(tgt_iso: str, tgt_nllb: str, max_samples: int | None) -> Dataset:
+    """
+    Load a Spanish-X language pair from Helsinki-NLP/opus-100.
+    opus-100 pairs are stored alphabetically, so es-gl and es-pt are valid keys.
+    """
+    if max_samples == 0:
+        return Dataset.from_list([])
+
+    pair = f"es-{tgt_iso}" if "es" < tgt_iso else f"{tgt_iso}-es"
+    print(f"Loading OPUS-100 {pair}…")
+
+    try:
+        ds = load_dataset("Helsinki-NLP/opus-100", pair, split="train",
+                          trust_remote_code=True)
+    except Exception as e:
+        print(f"  Warning: could not load {pair}: {e}")
+        return Dataset.from_list([])
+
+    rows = []
+    for r in ds:
+        t = r["translation"]
+        src = t.get("es")
+        tgt = t.get(tgt_iso)
+        if src and tgt:
+            rows.append({"source": src, "target": tgt,
+                         "src_lang": SRC_LANG, "tgt_lang": tgt_nllb})
+
+    result = Dataset.from_list(rows)
+    if max_samples and len(result) > max_samples:
+        result = result.shuffle(seed=42).select(range(max_samples))
+
+    print(f"  {pair}: {len(result):,} pairs")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# Tokenisation
+# ─────────────────────────────────────────────────────────────────
+def tokenize_group(examples: dict, tokenizer, max_length: int) -> dict:
+    """
+    Tokenize a batch where all examples share the same src/tgt language.
+    NLLB automatically prepends the target language token to labels when
+    text_target is used — this becomes the forced_bos_token during generation.
+    """
+    src_lang = examples["src_lang"][0]
+    tgt_lang = examples["tgt_lang"][0]
+
+    tokenizer.src_lang = src_lang
+    model_inputs = tokenizer(
+        examples["source"],
+        max_length=max_length,
+        truncation=True,
+        padding=False,
+    )
+    labels = tokenizer(
+        text_target=examples["target"],
+        max_length=max_length,
+        truncation=True,
+        padding=False,
+    )
+    model_inputs["labels"] = labels["input_ids"]
+    return model_inputs
+
+
+def tokenize_multilingual(ds: Dataset, tokenizer, max_length: int,
+                           desc: str = "") -> Dataset:
+    """
+    Tokenize a multilingual dataset by processing each target language
+    group separately (required so tokenizer.src_lang is consistent per batch).
+    """
+    parts = []
+    for lang_code in [AST_LANG, GL_LANG, PT_LANG]:
+        group = ds.filter(
+            lambda x, lc=lang_code: x["tgt_lang"] == lc,
+            num_proc=1,
+        )
+        if len(group) == 0:
+            continue
+        tok_group = group.map(
+            lambda ex: tokenize_group(ex, tokenizer, max_length),
+            batched=True,
+            batch_size=512,
+            remove_columns=group.column_names,
+            num_proc=1,   # single proc: tokenizer is not fork-safe
+            desc=f"Tokenising {desc} {lang_code}",
+        )
+        parts.append(tok_group)
+
+    combined = concatenate_datasets(parts)
+    return combined.shuffle(seed=42)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────
 def main() -> None:
     args = parse_args()
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    model_checkpoint = "Helsinki-NLP/opus-mt-es-ca"
-    max_input_length = 128
-    max_target_length = 128
+    cache_dir = Path(args.cache_dir)
+    tok_dir   = Path("./tokenizer_nllb")
 
-    tok_dir = Path("./my_tokenizer")
-    raw_disk = Path("./raw_es_ast")
-    tok_disk = Path("./tokenized_es_ast")
+    # ── Tokenizer ─────────────────────────────────────────────────
+    print("Loading tokenizer…")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_CHECKPOINT)
+    tok_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer.save_pretrained(str(tok_dir))
 
-    if args.skip_tokenize and tok_disk.is_dir() and raw_disk.is_dir():
-        print("Loading cached tokenized data from disk…")
-        tokenized_dataset = load_from_disk(str(tok_disk))
-        dataset = load_from_disk(str(raw_disk))
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(tok_dir) if tok_dir.is_dir() else model_checkpoint
-        )
+    ast_lang_id = tokenizer.convert_tokens_to_ids(AST_LANG)
+    print(f"  AST language token id: {ast_lang_id}")
+
+    # ── Data ──────────────────────────────────────────────────────
+    if args.skip_data and cache_dir.is_dir():
+        print(f"Loading cached tokenized data from {cache_dir}…")
+        tokenized = load_from_disk(str(cache_dir))
     else:
-        print("Loading ES–AST parallel corpus from Hugging Face…")
-        dataset = load_dataset(
-            "projecte-aina/ES-AST_Parallel_Corpus", split="train"
-        )
-        dataset = Dataset.from_list(
-            [
-                {"translation": {"spa": row["es"], "ast": row["ast"]}}
-                for row in dataset
-            ]
-        )
+        # Load raw data
+        ast_ds = load_ast()
+        gl_ds  = load_opus("gl", GL_LANG, args.gl_samples)
+        pt_ds  = load_opus("pt", PT_LANG, args.pt_samples)
 
-        print("Loading tokenizer…")
-        tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
-        tok_dir.mkdir(parents=True, exist_ok=True)
-        tokenizer.save_pretrained(str(tok_dir))
+        # Filter out empty datasets
+        parts = [d for d in [ast_ds, gl_ds, pt_ds] if len(d) > 0]
+        combined = concatenate_datasets(parts).shuffle(seed=42)
 
-        def preprocess_function(examples):
-            inputs = [ex["spa"] for ex in examples["translation"]]
-            targets = [ex["ast"] for ex in examples["translation"]]
-            model_inputs = tokenizer(
-                inputs, max_length=max_input_length, truncation=True
-            )
-            labels = tokenizer(
-                targets, max_length=max_target_length, truncation=True
-            )
-            model_inputs["labels"] = labels["input_ids"]
-            return model_inputs
+        print(f"\nTotal combined: {len(combined):,} pairs")
+        print(f"  Language breakdown:")
+        for lang in [AST_LANG, GL_LANG, PT_LANG]:
+            n = sum(1 for x in combined if x["tgt_lang"] == lang)
+            print(f"    {lang}: {n:,}")
 
-        nproc = min(8, (os.cpu_count() or 2))
-        print(f"Tokenizing dataset (num_proc={nproc})…")
-        tokenized_dataset = dataset.map(
-            preprocess_function,
-            batched=True,
-            remove_columns=dataset.column_names,
-            num_proc=nproc,
-        )
-        tokenized_dataset.save_to_disk(str(tok_disk))
-        dataset.save_to_disk(str(raw_disk))
-        print(f"Saved raw → {raw_disk}, tokenized → {tok_disk}")
+        # Train / validation split
+        # Val is AST-only so BLEU during training is directly comparable to FLORES+
+        ast_only = combined.filter(lambda x: x["tgt_lang"] == AST_LANG, num_proc=1)
+        non_ast  = combined.filter(lambda x: x["tgt_lang"] != AST_LANG, num_proc=1)
 
-    print("Loading model…")
-    # FP32 weights: mixed precision (fp16/bf16) is applied by the Trainer. Loading the
-    # model in full float16 makes gradients FP16 and breaks GradScaler (clip_grad_norm).
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_checkpoint)
+        ast_split = ast_only.train_test_split(test_size=0.01, seed=42)
+        val_ds    = ast_split["test"]
+        if args.eval_samples and len(val_ds) > args.eval_samples:
+            val_ds = val_ds.shuffle(43).select(range(args.eval_samples))
+
+        train_ds = concatenate_datasets([
+            ast_split["train"], non_ast
+        ]).shuffle(seed=42)
+
+        print(f"\nTrain: {len(train_ds):,}  |  Val (AST only): {len(val_ds):,}")
+
+        # Tokenize
+        print("\nTokenizing…")
+        tok_train = tokenize_multilingual(train_ds, tokenizer, MAX_LENGTH, "train")
+        tok_val   = tokenize_multilingual(val_ds,   tokenizer, MAX_LENGTH, "val")
+
+        tokenized = DatasetDict({"train": tok_train, "validation": tok_val})
+        tokenized.save_to_disk(str(cache_dir))
+        print(f"Saved tokenized data → {cache_dir}")
+
+    print(f"\nFinal: train={len(tokenized['train']):,}  "
+          f"val={len(tokenized['validation']):,}")
+
+    # ── Model + LoRA ──────────────────────────────────────────────
+    print("\nLoading NLLB-200-distilled-600M…")
+
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    dtype    = torch.bfloat16 if use_bf16 else torch.float32
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        MODEL_CHECKPOINT,
+        torch_dtype=dtype,
+    )
+
+    # LoRA: only train a tiny fraction of the model
+    # r=16 gives ~3.5M trainable out of 600M (0.58%)
+    lora_config = LoraConfig(
+        task_type       = TaskType.SEQ_2_SEQ_LM,
+        r               = args.lora_r,
+        lora_alpha      = args.lora_r * 2,
+        target_modules  = LORA_TARGET_MODULES,
+        lora_dropout    = LORA_DROPOUT,
+        bias            = "none",
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
 
-    print(
-        "\n  Base checkpoint: MarianMT opus-mt-es-ca (spa→ca), adapted on spa→ast data.\n"
-        "  (Not NLLB / not Basque — different architecture and language pair.)\n"
+    # Fix generation target to Asturian for eval
+    model.generation_config = GenerationConfig(
+        forced_bos_token_id = ast_lang_id,
+        max_new_tokens      = MAX_LENGTH,
     )
 
-    free_g = 0.0
-    total_g = 0.0
     if torch.cuda.is_available():
         model = model.to("cuda")
-        torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        try:
-            free_b, total_b = torch.cuda.mem_get_info()
-            free_g, total_g = free_b / 2**30, total_b / 2**30
-            _amp = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
-            print(
-                f"  Model on GPU (float32 params, Trainer AMP: {_amp}). "
-                f"Mem free ≈ {free_g:.2f} / {total_g:.2f} GiB.\n"
-                "  Other jobs using this GPU will force a smaller train batch (auto unless "
-                "--no_auto_batch).\n"
-            )
-        except AttributeError:
-            pass
+        free_b, total_b = torch.cuda.mem_get_info()
+        print(f"\nGPU: {free_b/2**30:.2f} / {total_b/2**30:.2f} GiB free after model load")
 
-    metric = evaluate.load("sacrebleu")
+    # ── Metric ────────────────────────────────────────────────────
+    bleu_metric = evaluate.load("sacrebleu")
 
-    def postprocess_text(preds, labels):
-        preds = [p.strip() for p in preds]
-        labels = [[l.strip()] for l in labels]
-        return preds, labels
-
-    def compute_metrics(eval_preds, tokenizer=tokenizer):
+    def compute_metrics(eval_preds):
         preds, labels = eval_preds
         if isinstance(preds, tuple):
             preds = preds[0]
-        preds = np.where(preds < tokenizer.vocab_size, preds, tokenizer.pad_token_id)
-        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
-        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
-        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
-        result = metric.compute(
-            predictions=decoded_preds, references=decoded_labels
-        )
+        # Guard against invalid ids (negatives or > vocab) which can crash fast tokenizers
+        # with `OverflowError: out of range integral type conversion attempted`.
+        preds = np.asarray(preds)
+        valid = (preds >= 0) & (preds < tokenizer.vocab_size)
+        preds = np.where(valid, preds, tokenizer.pad_token_id)
+        decoded = tokenizer.batch_decode(preds, skip_special_tokens=True)
+        labels  = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        refs    = [[r.strip()] for r in tokenizer.batch_decode(labels, skip_special_tokens=True)]
+        decoded = [d.strip() for d in decoded]
+        result  = bleu_metric.compute(predictions=decoded, references=refs)
         return {"bleu": round(result["score"], 2)}
 
-    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding=True)
-
-    split = tokenized_dataset.train_test_split(test_size=0.1, seed=42)
-    tokenized_split = DatasetDict(
-        {"train": split["train"], "validation": split["test"]}
-    )
-
-    if args.full:
-        train_limit = args.max_train_samples
-        eval_limit = args.max_eval_samples
-        epochs = args.num_train_epochs if args.num_train_epochs is not None else 3.0
-        train_bs = args.per_device_train_batch_size or 8
-        eval_bs = args.per_device_eval_batch_size or 8
-        eval_strategy = "steps"
-        eval_steps = 2000
-        save_strategy = "steps"
-        save_steps = 2000
-        print("Profile: FULL (slow)")
-    else:
-        train_limit = (
-            args.max_train_samples
-            if args.max_train_samples is not None
-            else FAST_TRAIN_SAMPLES
-        )
-        eval_limit = (
-            args.max_eval_samples
-            if args.max_eval_samples is not None
-            else FAST_EVAL_SAMPLES
-        )
-        epochs = args.num_train_epochs if args.num_train_epochs is not None else FAST_EPOCHS
-        train_bs = args.per_device_train_batch_size or FAST_TRAIN_BS
-        eval_bs = args.per_device_eval_batch_size or FAST_EVAL_BS
-        eval_strategy = "epoch"
-        eval_steps = None
-        save_strategy = "epoch"
-        save_steps = None
-        print("Profile: FAST (subsampled train/val, 1 epoch by default)")
-
-    tr = tokenized_split["train"]
-    if train_limit is not None and len(tr) > train_limit:
-        tr = tr.shuffle(seed=42).select(range(train_limit))
-    tokenized_split["train"] = tr
-
-    vs = tokenized_split["validation"]
-    if eval_limit is not None and len(vs) > eval_limit:
-        vs = vs.shuffle(seed=43).select(range(eval_limit))
-    tokenized_split["validation"] = vs
-
-    if args.gradient_accumulation_steps is not None:
-        grad_accum: int | None = args.gradient_accumulation_steps
-    elif not args.full and args.per_device_train_batch_size is None:
-        grad_accum = FAST_GRAD_ACCUM
-    else:
-        grad_accum = 1
-
-    target_eff = TARGET_EFFECTIVE_BATCH_FULL if args.full else TARGET_EFFECTIVE_BATCH_FAST
-    if torch.cuda.is_available() and not args.no_auto_batch:
-        train_bs, eval_bs, grad_accum, vram_note = apply_vram_clamp(
-            free_gib=free_g,
-            train_bs=train_bs,
-            eval_bs=eval_bs,
-            grad_accum=grad_accum,
-            target_effective=target_eff,
-        )
-    elif args.no_auto_batch and torch.cuda.is_available():
-        vram_note = "VRAM auto-tune disabled (--no_auto_batch); OOM possible if batch is too large."
-    else:
-        vram_note = "CPU: no VRAM auto-tune."
-
-    use_bf16 = torch.cuda.is_available() and getattr(
-        torch.cuda, "is_bf16_supported", lambda: False
-    )()
+    # ── Training arguments ────────────────────────────────────────
+    n_train  = len(tokenized["train"])
     use_fp16 = torch.cuda.is_available() and not use_bf16
-    use_adafactor = args.optim == "adafactor"
-    weight_decay = 0.0 if use_adafactor else 0.01
-    lr = 1e-4 if use_adafactor else 2e-5
 
-    n_train = len(tokenized_split["train"])
-    n_dev = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    updates_per_epoch = max(1, n_train // (train_bs * grad_accum * max(1, n_dev)))
-    warmup_steps = max(50, min(2000, int(0.06 * updates_per_epoch * epochs)))
+    # Eval every 10% of an epoch (at minimum every 1000 steps)
+    updates_per_epoch = max(1, n_train // (TRAIN_BS * GRAD_ACCUM))
+    eval_steps = max(1000, updates_per_epoch // 10)
 
-    print(
-        f"Train: {n_train:,} | "
-        f"Val: {len(tokenized_split['validation']):,} | "
-        f"epochs={epochs} | optim={args.optim} | lr={lr} | "
-        f"train_bs={train_bs} × grad_accum={grad_accum} "
-        f"(effective {train_bs * grad_accum}) | "
-        f"checkpointing=on | warmup_steps={warmup_steps}"
+    training_args = Seq2SeqTrainingArguments(
+        output_dir                  = args.output_dir,
+        num_train_epochs            = args.epochs,
+        per_device_train_batch_size = TRAIN_BS,
+        per_device_eval_batch_size  = EVAL_BS,
+        gradient_accumulation_steps = GRAD_ACCUM,
+        gradient_checkpointing      = True,
+        optim                       = "adafactor",
+        learning_rate               = LR,
+        warmup_ratio                = WARMUP_RATIO,
+        weight_decay                = 0.0,
+        bf16                        = use_bf16,
+        fp16                        = use_fp16,
+        logging_steps               = 200,
+        eval_strategy               = "steps",
+        eval_steps                  = eval_steps,
+        save_strategy               = "steps",
+        save_steps                  = eval_steps,
+        save_total_limit            = 2,
+        load_best_model_at_end      = True,
+        metric_for_best_model       = "eval_bleu",
+        greater_is_better           = True,
+        predict_with_generate       = True,
+        generation_max_length       = MAX_LENGTH,
+        # Python 3.14+ uses forkserver workers by default; collator holds `model` → unpicklable.
+        dataloader_num_workers      = 0,
+        dataloader_pin_memory       = torch.cuda.is_available(),
+        report_to                   = "none",
     )
-    print(f"  {vram_note}\n")
 
-    ta_kw: dict = dict(
-        output_dir=args.output_dir,
-        optim=args.optim,
-        learning_rate=lr,
-        warmup_steps=warmup_steps,
-        per_device_train_batch_size=train_bs,
-        per_device_eval_batch_size=eval_bs,
-        gradient_accumulation_steps=grad_accum,
-        gradient_checkpointing=True,
-        num_train_epochs=epochs,
-        weight_decay=weight_decay,
-        logging_steps=50,
-        report_to="none",
-        eval_strategy=eval_strategy,
-        save_strategy=save_strategy,
-        save_total_limit=2,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_bleu",
-        greater_is_better=True,
-        predict_with_generate=True,
-        fp16=use_fp16,
-        bf16=use_bf16,
-        dataloader_num_workers=min(8, (os.cpu_count() or 2)),
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer, model=model, padding=True, pad_to_multiple_of=8,
     )
-    if eval_steps is not None:
-        ta_kw["eval_steps"] = eval_steps
-    if save_steps is not None:
-        ta_kw["save_steps"] = save_steps
 
-    training_args = Seq2SeqTrainingArguments(**ta_kw)
-
-    _trainer_kw = dict(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_split["train"],
-        eval_dataset=tokenized_split["validation"],
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
+    # Handle tokenizer / processing_class API difference across versions
+    trainer_kw: dict = dict(
+        model           = model,
+        args            = training_args,
+        train_dataset   = tokenized["train"],
+        eval_dataset    = tokenized["validation"],
+        data_collator   = data_collator,
+        compute_metrics = compute_metrics,
     )
-    _sig = inspect.signature(Seq2SeqTrainer.__init__)
-    if "processing_class" in _sig.parameters:
-        _trainer_kw["processing_class"] = tokenizer
-    else:
-        _trainer_kw["tokenizer"] = tokenizer
+    sig = inspect.signature(Seq2SeqTrainer.__init__)
+    trainer_kw[
+        "processing_class" if "processing_class" in sig.parameters else "tokenizer"
+    ] = tokenizer
 
-    trainer = Seq2SeqTrainer(**_trainer_kw)
+    trainer = Seq2SeqTrainer(**trainer_kw)
 
-    print("Starting training…")
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    # ── Train ─────────────────────────────────────────────────────
+    print(f"\nStarting training…")
+    print(f"  Total pairs  : {n_train:,}")
+    print(f"  Epochs       : {args.epochs}")
+    print(f"  Effective BS : {TRAIN_BS * GRAD_ACCUM}")
+    print(f"  Eval every   : {eval_steps} steps")
+    print(f"  LoRA rank    : {args.lora_r}  (trainable params ≈ 0.5% of 600M)\n")
 
+    trainer.train()
+
+    # ── Save ──────────────────────────────────────────────────────
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-    trainer.save_model(str(save_dir))
+
+    if args.merge_weights:
+        # Merge LoRA into base weights — larger file, no PEFT dependency at inference
+        print("Merging LoRA weights into base model…")
+        merged = model.merge_and_unload()
+        merged.save_pretrained(str(save_dir))
+        print(f"Merged model saved → {save_dir}")
+    else:
+        # Save LoRA adapter only — small file, requires PEFT at inference
+        trainer.save_model(str(save_dir))
+        print(f"LoRA adapter saved → {save_dir}")
+
     tokenizer.save_pretrained(str(save_dir))
-    print(f"Fine-tuned model saved to {save_dir.resolve()}")
+    print(f"Tokenizer saved   → {save_dir}")
+    print("\nDone.")
 
 
 if __name__ == "__main__":
     main()
+
